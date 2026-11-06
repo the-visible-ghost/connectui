@@ -4,3 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+futures-lite = "2.6.1"
+iocraft = "0.9.3"
+smol = "2.0.2"
+zbus = { version = "6.0.0", default-features = false, features = [
+    "default-rt",
+    "proxy",
+] }
