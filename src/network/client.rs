@@ -5,6 +5,9 @@ use std::time::{Duration, Instant};
 use futures_lite::{Stream, StreamExt};
 use zbus::{Connection, OwnedObjectPath, OwnedVariant, Proxy, Variant};
 
+use super::profile::{
+    DeviceInfo, DeviceKind, ProfileDraft, draft_from_settings, settings_from_draft,
+};
 use super::types::{ActiveWifi, KnownProfile, Security, Snapshot, WifiNetwork, WifiState};
 
 const NM_DEST: &str = "org.freedesktop.NetworkManager";
@@ -293,7 +296,7 @@ impl NMClient {
         Ok(())
     }
 
-    async fn find_saved_connection(
+    pub async fn find_saved_connection(
         &self,
         ssid: &str,
     ) -> Result<Option<OwnedObjectPath>, NetworkError> {
@@ -325,6 +328,68 @@ impl NMClient {
         }
 
         Ok(None)
+    }
+
+    pub async fn devices(&self) -> Result<Vec<DeviceInfo>, NetworkError> {
+        let network_manager = Proxy::new(&self.connection, NM_DEST, NM_PATH, NM_IFACE).await?;
+        let devices: Vec<OwnedObjectPath> = network_manager.call("GetDevices", &()).await?;
+        let mut result = Vec::new();
+
+        for path in devices {
+            let proxy = Proxy::new(&self.connection, NM_DEST, path.as_str(), DEVICE_IFACE).await?;
+            let device_type = proxy.get_property::<u32>("DeviceType").await.unwrap_or(0);
+            let kind = match device_type {
+                1 => DeviceKind::Ethernet,
+                2 => DeviceKind::Wifi,
+                _ => continue,
+            };
+            let interface = proxy
+                .get_property::<String>("Interface")
+                .await
+                .unwrap_or_else(|_| path.to_string());
+            result.push(DeviceInfo {
+                path,
+                interface,
+                kind,
+            });
+        }
+
+        result.sort_by(|left, right| left.interface.cmp(&right.interface));
+        Ok(result)
+    }
+
+    pub async fn load_profile(&self, path: &OwnedObjectPath) -> Result<ProfileDraft, NetworkError> {
+        let proxy = Proxy::new(
+            &self.connection,
+            NM_DEST,
+            path.as_str(),
+            SETTINGS_CONNECTION_IFACE,
+        )
+        .await?;
+        let settings: HashMap<String, PropMap> = proxy.call("GetSettings", &()).await?;
+        draft_from_settings(path.clone(), &settings).map_err(NetworkError::Message)
+    }
+
+    pub async fn save_profile(&self, draft: &ProfileDraft) -> Result<(), NetworkError> {
+        if let Some(path) = &draft.path {
+            let proxy = Proxy::new(
+                &self.connection,
+                NM_DEST,
+                path.as_str(),
+                SETTINGS_CONNECTION_IFACE,
+            )
+            .await?;
+            let settings: HashMap<String, PropMap> = proxy.call("GetSettings", &()).await?;
+            let settings =
+                settings_from_draft(draft, Some(settings)).map_err(NetworkError::Message)?;
+            let _: () = proxy.call("Update", &(settings,)).await?;
+        } else {
+            let settings = settings_from_draft(draft, None).map_err(NetworkError::Message)?;
+            let settings_proxy =
+                Proxy::new(&self.connection, NM_DEST, SETTINGS_PATH, SETTINGS_IFACE).await?;
+            let _: OwnedObjectPath = settings_proxy.call("AddConnection", &(settings,)).await?;
+        }
+        Ok(())
     }
 
     pub async fn known_profiles(&self) -> Result<HashMap<String, KnownProfile>, NetworkError> {

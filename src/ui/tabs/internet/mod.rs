@@ -1,14 +1,16 @@
 mod connection;
+mod editor;
 mod networks;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::network::{ConnectOutcome, KnownProfile, NMClient, Security, Snapshot};
+use crate::network::{ConnectOutcome, KnownProfile, NMClient, ProfileDraft, Security, Snapshot};
 use crate::ui::common::{Props, Theme};
 use crate::ui::notification::{Notification, NotificationLevel, notify};
 use connection::connection_panel;
+use editor::{EditorAction, EditorState, editor_overlay, editor_panel, footer_hint, handle_key};
 use iocraft::components::ScrollViewHandle;
 use iocraft::prelude::*;
 use networks::{NetworksView, PendingConnect, networks_panel, spinner_frame};
@@ -44,6 +46,14 @@ enum Command {
     },
     Disconnect {
         active: OwnedObjectPath,
+    },
+    OpenEditor {
+        ssid: String,
+        security: Security,
+        interface: String,
+    },
+    SaveProfile {
+        draft: Box<ProfileDraft>,
     },
 }
 
@@ -175,7 +185,10 @@ pub fn InternetContent(mut hooks: Hooks, props: &Props) -> impl Into<AnyElement<
     let mut modal_active = props.modal_active.unwrap_or(local_modal);
     let local_notifications = hooks.use_state(Vec::<Notification>::new);
     let notifications = props.notifications.unwrap_or(local_notifications);
+    let mut footer_override = props.footer;
+    let mut editor = hooks.use_state(|| None::<EditorState>);
     let scroll = hooks.use_ref_default::<ScrollViewHandle>();
+    let editor_scroll = hooks.use_ref_default::<ScrollViewHandle>();
     let channels = hooks.use_state(|| {
         let (tx, rx) = unbounded::<Command>();
         Channels {
@@ -422,6 +435,77 @@ pub fn InternetContent(mut hooks: Hooks, props: &Props) -> impl Into<AnyElement<
                             }
                             busy.set(false);
                         }
+                        Command::OpenEditor {
+                            ssid,
+                            security,
+                            interface,
+                        } => {
+                            let loaded = match client.find_saved_connection(&ssid).await {
+                                Ok(Some(path)) => {
+                                    client.load_profile(&path).await.map(|draft| (draft, false))
+                                }
+                                Ok(None) => {
+                                    Ok((ProfileDraft::new_wifi(&ssid, security, &interface), true))
+                                }
+                                Err(error_value) => Err(error_value),
+                            };
+                            match loaded {
+                                Ok((draft, is_new)) => {
+                                    let devices = client.devices().await.unwrap_or_default();
+                                    editor.set(Some(EditorState::new(draft, devices, is_new)));
+                                    modal_active.set(true);
+                                    if let Some(footer) = footer_override.as_mut() {
+                                        footer.set(Some(footer_hint(u32::from(terminal_width))));
+                                    }
+                                }
+                                Err(error_value) => {
+                                    let message = error_value.to_string();
+                                    error.set(Some(message.clone()));
+                                    notify(
+                                        notifications,
+                                        NotificationLevel::Error,
+                                        "Edit failed",
+                                        message,
+                                    );
+                                }
+                            }
+                        }
+                        Command::SaveProfile { draft } => {
+                            let profile = draft.id.clone();
+                            match client.save_profile(&draft).await {
+                                Ok(()) => {
+                                    if let Ok(updated) = client.known_profiles().await {
+                                        known_profiles = updated;
+                                    }
+                                    editor.set(None);
+                                    modal_active.set(false);
+                                    if let Some(footer) = footer_override.as_mut() {
+                                        footer.set(None);
+                                    }
+                                    notify(
+                                        notifications,
+                                        NotificationLevel::Success,
+                                        "Profile saved",
+                                        profile,
+                                    );
+                                }
+                                Err(error_value) => {
+                                    let message = error_value.to_string();
+                                    let mut current = editor.read().clone().unwrap_or_else(|| {
+                                        EditorState::new((*draft).clone(), Vec::new(), false)
+                                    });
+                                    current.saving = false;
+                                    current.error = Some(message.clone());
+                                    editor.set(Some(current));
+                                    notify(
+                                        notifications,
+                                        NotificationLevel::Error,
+                                        "Save failed",
+                                        message,
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 Some(Err(_)) => break,
@@ -464,6 +548,34 @@ pub fn InternetContent(mut hooks: Hooks, props: &Props) -> impl Into<AnyElement<
             }
         },
         (selected_row, network_count, terminal_height),
+    );
+
+    let current_editor = (*editor.read()).clone();
+    let editor_row = current_editor
+        .as_ref()
+        .map(EditorState::selected_row)
+        .unwrap_or(0);
+    let editor_open = current_editor.is_some();
+    let mut editor_scroll_handle = editor_scroll;
+    hooks.use_effect(
+        move || {
+            if !editor_open {
+                return;
+            }
+            let viewport = editor_scroll_handle.read().viewport_height() as usize;
+            if viewport == 0 {
+                return;
+            }
+            let offset = editor_scroll_handle.read().scroll_offset().max(0) as usize;
+            if editor_row < offset {
+                editor_scroll_handle.write().scroll_to(editor_row as i32);
+            } else if editor_row >= offset + viewport {
+                editor_scroll_handle
+                    .write()
+                    .scroll_to((editor_row + 1 - viewport) as i32);
+            }
+        },
+        (editor_row, editor_open, terminal_height),
     );
 
     hooks.use_terminal_events({
@@ -534,6 +646,44 @@ pub fn InternetContent(mut hooks: Hooks, props: &Props) -> impl Into<AnyElement<
                 return;
             }
 
+            let active_editor = (*editor.read()).clone();
+            if let Some(mut current) = active_editor {
+                if g_pressed.get() {
+                    g_pressed.set(false);
+                }
+                let was_dirty = current.dirty();
+                match handle_key(&mut current, code) {
+                    EditorAction::None => editor.set(Some(current)),
+                    EditorAction::Close => {
+                        editor.set(None);
+                        modal_active.set(false);
+                        if let Some(footer) = footer_override.as_mut() {
+                            footer.set(None);
+                        }
+                        if was_dirty {
+                            notify(
+                                notifications,
+                                NotificationLevel::Info,
+                                "Profile editor",
+                                "Changes discarded",
+                            );
+                        }
+                    }
+                    EditorAction::Save(draft) => {
+                        editor.set(Some(current));
+                        if tx.try_send(Command::SaveProfile { draft }).is_err() {
+                            let mut state = editor.read().clone();
+                            if let Some(state) = state.as_mut() {
+                                state.saving = false;
+                                state.error = Some("Could not save the profile".to_string());
+                            }
+                            editor.set(state);
+                        }
+                    }
+                }
+                return;
+            }
+
             if code == KeyCode::Char('g') {
                 if g_pressed.get() {
                     selected_index.set(0);
@@ -564,6 +714,47 @@ pub fn InternetContent(mut hooks: Hooks, props: &Props) -> impl Into<AnyElement<
                         .unwrap_or(0);
                     if count > 0 {
                         selected_index.set(count - 1);
+                    }
+                }
+                KeyCode::Char('e') | KeyCode::Char('E') => {
+                    if busy.get() {
+                        return;
+                    }
+                    let Some(wifi) = snapshot_copy(snapshot).wifi else {
+                        return;
+                    };
+                    let target = if code == KeyCode::Char('E') {
+                        let Some(active) = wifi.active.as_ref() else {
+                            notify(
+                                notifications,
+                                NotificationLevel::Info,
+                                "Profile editor",
+                                "No active connection",
+                            );
+                            return;
+                        };
+                        (active.ssid.clone(), active.security)
+                    } else {
+                        let index = selected_index
+                            .get()
+                            .min(wifi.networks.len().saturating_sub(1));
+                        let Some(network) = wifi.networks.get(index) else {
+                            return;
+                        };
+                        (network.ssid.clone(), network.security)
+                    };
+                    let command = Command::OpenEditor {
+                        ssid: target.0,
+                        security: target.1,
+                        interface: wifi.interface.clone(),
+                    };
+                    if tx.try_send(command).is_err() {
+                        notify(
+                            notifications,
+                            NotificationLevel::Error,
+                            "Profile editor",
+                            "Could not open the editor",
+                        );
                     }
                 }
                 KeyCode::Char('s') => {
@@ -641,6 +832,40 @@ pub fn InternetContent(mut hooks: Hooks, props: &Props) -> impl Into<AnyElement<
     } else {
         None
     };
+    let editor_view = current_editor
+        .as_ref()
+        .map(|editor| editor_panel(theme, editor, u32::from(terminal_width), editor_scroll));
+    let editor_overlay_view = current_editor
+        .as_ref()
+        .and_then(|editor| editor_overlay(theme, editor));
+    let normal_panel: Option<AnyElement<'static>> = current_editor.is_none().then(|| {
+        element! {
+            View(
+                flex_grow: 1.0,
+                width: 100pct,
+                flex_direction: FlexDirection::Column,
+            ) {
+                #(Some(connection_panel(
+                    theme,
+                    matches!(focused, Menu::Connection),
+                    wifi,
+                    activity_status,
+                    spinner_value,
+                )))
+                #(Some(networks_panel(NetworksView {
+                    theme,
+                    focused: matches!(focused, Menu::Network),
+                    networks: network_list,
+                    selected: current_index,
+                    table_width,
+                    status: table_status,
+                    spinner: spinner_value,
+                    handle: scroll,
+                })))
+            }
+        }
+        .into_any()
+    });
 
     element! {
         View(
@@ -648,23 +873,9 @@ pub fn InternetContent(mut hooks: Hooks, props: &Props) -> impl Into<AnyElement<
             width: 100pct,
             flex_direction: FlexDirection::Column,
         ) {
-            #(Some(connection_panel(
-                theme,
-                matches!(focused, Menu::Connection),
-                wifi,
-                activity_status,
-                spinner_value,
-            )))
-            #(Some(networks_panel(NetworksView {
-                theme,
-                focused: matches!(focused, Menu::Network),
-                networks: network_list,
-                selected: current_index,
-                table_width,
-                status: table_status,
-                spinner: spinner_value,
-                handle: scroll,
-            })))
+            #(normal_panel)
+            #(editor_view)
+            #(editor_overlay_view)
             #(prompt.as_ref().map(|prompt| {
                 password_modal(theme, prompt, &password_value)
             }))

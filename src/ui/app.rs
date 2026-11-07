@@ -14,6 +14,7 @@ pub fn FullScreen(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let mut tab = hooks.use_state(|| Tab::Internet);
     let mut should_exit = hooks.use_state(|| false);
     let mut modal_active = hooks.use_state(|| false);
+    let mut footer_override = hooks.use_state(|| None::<String>);
     let mut notifications = hooks.use_state(Vec::<Notification>::new);
 
     hooks.use_future(async move {
@@ -36,9 +37,18 @@ pub fn FullScreen(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                 }
                 match code {
                     KeyCode::Char('q') => should_exit.set(true),
-                    KeyCode::Char('i') => tab.set(Tab::Internet),
-                    KeyCode::Char('b') => tab.set(Tab::Bluetooth),
-                    KeyCode::Char('v') => tab.set(Tab::VPN),
+                    KeyCode::Char('i') => {
+                        tab.set(Tab::Internet);
+                        footer_override.set(None);
+                    }
+                    KeyCode::Char('b') => {
+                        tab.set(Tab::Bluetooth);
+                        footer_override.set(None);
+                    }
+                    KeyCode::Char('v') => {
+                        tab.set(Tab::VPN);
+                        footer_override.set(None);
+                    }
                     _ => {}
                 }
             }
@@ -51,11 +61,13 @@ pub fn FullScreen(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     }
 
     let notification_items = (*notifications.read()).clone();
-    let footer = if width < 120 {
-        "󱁐/󰌑 Connect | d Remove | s Scan | j/k Move | Tab Panel | q Quit"
-    } else {
-        "󱁐 or 󰌑 Dis/connect  |  d Remove  |  s scan  |  k or \u{eaa1}  Up  |  j or \u{ea9a}  Down  |  (Shift+)Tab Panel  |  q Quit"
-    };
+    let footer = footer_override.read().clone().unwrap_or_else(|| {
+        if width < 120 {
+            "󱁐/󰌑 Connect | d Remove | s Scan | j/k Move | Tab Panel | q Quit".to_string()
+        } else {
+            "󱁐 or 󰌑 Dis/connect  |  d Remove  |  s scan  |  k or \u{eaa1}  Up  |  j or \u{ea9a}  Down  |  (Shift+)Tab Panel  |  q Quit".to_string()
+        }
+    });
     let theme = match tab.get() {
         Tab::Internet => Theme {
             primary: Color::Green,
@@ -102,8 +114,12 @@ pub fn FullScreen(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                     top: -2,
                 ) {
                     Button(handler: move |_| {
+                        if modal_active.get() {
+                            return;
+                        }
                         tab.set(Tab::Internet);
                         modal_active.set(false);
+                        footer_override.set(None);
                     }) {
                         View(
                             border_color: match tab.get() {
@@ -126,8 +142,12 @@ pub fn FullScreen(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                         }
                     }
                     Button(handler: move |_| {
+                        if modal_active.get() {
+                            return;
+                        }
                         tab.set(Tab::Bluetooth);
                         modal_active.set(false);
+                        footer_override.set(None);
                     }) {
                         View(
                             border_color: match tab.get() {
@@ -150,8 +170,12 @@ pub fn FullScreen(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                         }
                     }
                     Button(handler: move |_| {
+                        if modal_active.get() {
+                            return;
+                        }
                         tab.set(Tab::VPN);
                         modal_active.set(false);
+                        footer_override.set(None);
                     }) {
                         View(
                             border_color: match tab.get() {
@@ -180,6 +204,7 @@ pub fn FullScreen(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                         theme: theme,
                         modal_active: modal_active,
                         notifications: notifications,
+                        footer: footer_override,
                     )).into_any(),
                     Tab::Bluetooth => element!(BluetoothContent(theme: theme)).into_any(),
                     Tab::VPN => element!(VpnContent(theme: theme)).into_any(),

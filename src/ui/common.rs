@@ -36,4 +36,5 @@ pub struct Props {
     pub theme: Theme,
     pub modal_active: Option<State<bool>>,
     pub notifications: Option<State<Vec<Notification>>>,
+    pub footer: Option<State<Option<String>>>,
 }
