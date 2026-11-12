@@ -10,7 +10,9 @@ use crate::network::{ConnectOutcome, KnownProfile, NMClient, ProfileDraft, Secur
 use crate::ui::common::{Props, Theme};
 use crate::ui::notification::{Notification, NotificationLevel, notify};
 use connection::connection_panel;
-use editor::{EditorAction, EditorState, editor_overlay, editor_panel, footer_hint, handle_key};
+use editor::{
+    EditorAction, EditorState, EditorUi, editor_overlay, editor_panel, footer_hint, handle_key,
+};
 use iocraft::components::ScrollViewHandle;
 use iocraft::prelude::*;
 use networks::{NetworksView, PendingConnect, networks_panel, spinner_frame};
@@ -33,7 +35,7 @@ impl std::convert::From<i8> for Menu {
     }
 }
 
-enum Command {
+pub(super) enum Command {
     Scan {
         device: OwnedObjectPath,
     },
@@ -54,6 +56,9 @@ enum Command {
     },
     SaveProfile {
         draft: Box<ProfileDraft>,
+    },
+    RemoveProfile {
+        ssid: String,
     },
 }
 
@@ -168,6 +173,59 @@ fn password_modal(theme: Theme, prompt: &PendingConnect, password: &str) -> AnyE
     .into_any()
 }
 
+fn remove_modal(ssid: &str) -> AnyElement<'static> {
+    let ssid: String = ssid.chars().take(40).collect();
+
+    element! {
+        View(
+            position: Position::Absolute,
+            top: 0,
+            left: 0,
+            width: 100pct,
+            height: 100pct,
+            flex_direction: FlexDirection::Column,
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::Center,
+        ) {
+            View(
+                width: 56,
+                max_width: 80pct,
+                flex_direction: FlexDirection::Column,
+                border_style: BorderStyle::Round,
+                border_color: Color::Red,
+                background_color: Color::Black,
+                padding_left: 2,
+                padding_right: 2,
+                padding_top: 1,
+                padding_bottom: 1,
+                gap: 1,
+            ) {
+                View(width: 100pct, justify_content: JustifyContent::Center) {
+                    Text(
+                        content: "󰆴 REMOVE SAVED PROFILE",
+                        color: Color::Red,
+                        weight: Weight::Bold,
+                    )
+                }
+                View(width: 100pct, justify_content: JustifyContent::Center) {
+                    Text(
+                        content: format!("Remove saved profile for {ssid}?"),
+                        color: Color::White,
+                        wrap: TextWrap::NoWrap,
+                    )
+                }
+                View(width: 100pct, justify_content: JustifyContent::Center) {
+                    Text(
+                        content: "Enter remove · Esc cancel",
+                        color: Color::Grey,
+                    )
+                }
+            }
+        }
+    }
+    .into_any()
+}
+
 #[component]
 pub fn InternetContent(mut hooks: Hooks, props: &Props) -> impl Into<AnyElement<'static>> {
     let mut menu = hooks.use_state(|| Menu::Connection);
@@ -177,9 +235,11 @@ pub fn InternetContent(mut hooks: Hooks, props: &Props) -> impl Into<AnyElement<
     let mut scanning = hooks.use_state(|| false);
     let mut busy = hooks.use_state(|| false);
     let mut connecting = hooks.use_state(|| false);
+    let mut removing = hooks.use_state(|| false);
     let mut spinner = hooks.use_state(|| 0usize);
     let mut error = hooks.use_state(|| None::<String>);
     let mut pending = hooks.use_state(|| None::<PendingConnect>);
+    let mut pending_remove = hooks.use_state(|| None::<String>);
     let mut password = hooks.use_state(String::new);
     let local_modal = hooks.use_state(|| false);
     let mut modal_active = props.modal_active.unwrap_or(local_modal);
@@ -201,6 +261,13 @@ pub fn InternetContent(mut hooks: Hooks, props: &Props) -> impl Into<AnyElement<
         let channels = channels.read();
         (channels.tx.clone(), Arc::clone(&channels.rx))
     };
+    let editor_ui = EditorUi::new(
+        editor,
+        modal_active,
+        footer_override,
+        notifications,
+        tx.clone(),
+    );
 
     hooks.use_future(async move {
         loop {
@@ -506,6 +573,47 @@ pub fn InternetContent(mut hooks: Hooks, props: &Props) -> impl Into<AnyElement<
                                 }
                             }
                         }
+                        Command::RemoveProfile { ssid } => {
+                            busy.set(true);
+                            removing.set(true);
+                            notify(
+                                notifications,
+                                NotificationLevel::Info,
+                                "Profile",
+                                format!("Removing {ssid}"),
+                            );
+                            match client.remove_saved_connection(&ssid).await {
+                                Ok(true) => {
+                                    if let Ok(updated) = client.known_profiles().await {
+                                        known_profiles = updated;
+                                    }
+                                    notify(
+                                        notifications,
+                                        NotificationLevel::Success,
+                                        "Profile removed",
+                                        ssid,
+                                    );
+                                }
+                                Ok(false) => notify(
+                                    notifications,
+                                    NotificationLevel::Warning,
+                                    "Profile",
+                                    format!("No saved profile for {ssid}"),
+                                ),
+                                Err(error_value) => {
+                                    let message = error_value.to_string();
+                                    error.set(Some(message.clone()));
+                                    notify(
+                                        notifications,
+                                        NotificationLevel::Error,
+                                        "Remove failed",
+                                        message,
+                                    );
+                                }
+                            }
+                            removing.set(false);
+                            busy.set(false);
+                        }
                     }
                 }
                 Some(Err(_)) => break,
@@ -551,10 +659,10 @@ pub fn InternetContent(mut hooks: Hooks, props: &Props) -> impl Into<AnyElement<
     );
 
     let current_editor = (*editor.read()).clone();
-    let editor_row = current_editor
+    let (editor_top, editor_height) = current_editor
         .as_ref()
-        .map(EditorState::selected_row)
-        .unwrap_or(0);
+        .map(EditorState::selected_span)
+        .unwrap_or((0, 1));
     let editor_open = current_editor.is_some();
     let mut editor_scroll_handle = editor_scroll;
     hooks.use_effect(
@@ -567,23 +675,36 @@ pub fn InternetContent(mut hooks: Hooks, props: &Props) -> impl Into<AnyElement<
                 return;
             }
             let offset = editor_scroll_handle.read().scroll_offset().max(0) as usize;
-            if editor_row < offset {
-                editor_scroll_handle.write().scroll_to(editor_row as i32);
-            } else if editor_row >= offset + viewport {
+            if editor_top < offset {
+                editor_scroll_handle.write().scroll_to(editor_top as i32);
+            } else if editor_top + editor_height > offset + viewport {
                 editor_scroll_handle
                     .write()
-                    .scroll_to((editor_row + 1 - viewport) as i32);
+                    .scroll_to((editor_top + editor_height - viewport) as i32);
             }
         },
-        (editor_row, editor_open, terminal_height),
+        (editor_top, editor_height, editor_open, terminal_height),
     );
 
+    let mut save_ui = editor_ui.clone();
     hooks.use_terminal_events({
         move |event| {
-            let TerminalEvent::Key(KeyEvent { code, kind, .. }) = event else {
+            let TerminalEvent::Key(KeyEvent {
+                code,
+                kind,
+                modifiers,
+                ..
+            }) = event
+            else {
                 return;
             };
             if kind == KeyEventKind::Release {
+                return;
+            }
+            if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('s') {
+                if (*editor.read()).is_some() {
+                    save_ui.request_save();
+                }
                 return;
             }
 
@@ -642,6 +763,43 @@ pub fn InternetContent(mut hooks: Hooks, props: &Props) -> impl Into<AnyElement<
                         password.set(value);
                     }
                     _ => {}
+                }
+                return;
+            }
+
+            let pending_remove_target = (*pending_remove.read()).clone();
+            if let Some(ssid) = pending_remove_target {
+                if g_pressed.get() {
+                    g_pressed.set(false);
+                }
+                match code {
+                    KeyCode::Esc => {
+                        notify(
+                            notifications,
+                            NotificationLevel::Info,
+                            "Profile",
+                            "Remove cancelled",
+                        );
+                    }
+                    KeyCode::Enter => {
+                        if tx.try_send(Command::RemoveProfile { ssid }).is_err() {
+                            notify(
+                                notifications,
+                                NotificationLevel::Error,
+                                "Profile",
+                                "Could not remove the profile",
+                            );
+                        } else {
+                            busy.set(true);
+                            removing.set(true);
+                        }
+                    }
+                    _ => return,
+                }
+                pending_remove.set(None);
+                modal_active.set(false);
+                if let Some(footer) = footer_override.as_mut() {
+                    footer.set(None);
                 }
                 return;
             }
@@ -768,6 +926,43 @@ pub fn InternetContent(mut hooks: Hooks, props: &Props) -> impl Into<AnyElement<
                         });
                     }
                 }
+                KeyCode::Char('d') => {
+                    if busy.get() {
+                        return;
+                    }
+                    let Some(wifi) = snapshot_copy(snapshot).wifi else {
+                        return;
+                    };
+                    let index = selected_index
+                        .get()
+                        .min(wifi.networks.len().saturating_sub(1));
+                    let Some(network) = wifi.networks.get(index) else {
+                        return;
+                    };
+                    if network.active {
+                        notify(
+                            notifications,
+                            NotificationLevel::Warning,
+                            "Profile",
+                            "Cannot remove the active connection",
+                        );
+                        return;
+                    }
+                    if !network.known {
+                        notify(
+                            notifications,
+                            NotificationLevel::Info,
+                            "Profile",
+                            format!("No saved profile for {}", network.ssid),
+                        );
+                        return;
+                    }
+                    pending_remove.set(Some(network.ssid.clone()));
+                    modal_active.set(true);
+                    if let Some(footer) = footer_override.as_mut() {
+                        footer.set(Some("Enter Remove · Esc Cancel".to_string()));
+                    }
+                }
                 KeyCode::Char(' ') | KeyCode::Enter => {
                     if busy.get() {
                         return;
@@ -815,11 +1010,14 @@ pub fn InternetContent(mut hooks: Hooks, props: &Props) -> impl Into<AnyElement<
     let theme = props.theme;
     let focused = menu.get();
     let prompt = (*pending.read()).clone();
+    let remove_target = (*pending_remove.read()).clone();
     let password_value = (*password.read()).clone();
     let wifi = current.wifi.as_ref();
     let spinner_value = spinner_frame(spinner.get());
     let activity_status = if connecting.get() {
         Some("Connecting")
+    } else if removing.get() {
+        Some("Removing")
     } else if busy.get() {
         Some("Disconnecting")
     } else {
@@ -832,12 +1030,18 @@ pub fn InternetContent(mut hooks: Hooks, props: &Props) -> impl Into<AnyElement<
     } else {
         None
     };
-    let editor_view = current_editor
-        .as_ref()
-        .map(|editor| editor_panel(theme, editor, u32::from(terminal_width), editor_scroll));
+    let editor_view = current_editor.as_ref().map(|editor| {
+        editor_panel(
+            theme,
+            editor,
+            u32::from(terminal_width),
+            editor_scroll,
+            editor_ui.clone(),
+        )
+    });
     let editor_overlay_view = current_editor
         .as_ref()
-        .and_then(|editor| editor_overlay(theme, editor));
+        .and_then(|editor| editor_overlay(theme, editor, editor_ui.clone()));
     let normal_panel: Option<AnyElement<'static>> = current_editor.is_none().then(|| {
         element! {
             View(
@@ -879,6 +1083,7 @@ pub fn InternetContent(mut hooks: Hooks, props: &Props) -> impl Into<AnyElement<
             #(prompt.as_ref().map(|prompt| {
                 password_modal(theme, prompt, &password_value)
             }))
+            #(remove_target.as_ref().map(|ssid| remove_modal(ssid)))
         }
     }
 }

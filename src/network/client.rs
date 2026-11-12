@@ -330,6 +330,14 @@ impl NMClient {
         Ok(None)
     }
 
+    pub async fn remove_saved_connection(&self, ssid: &str) -> Result<bool, NetworkError> {
+        let Some(path) = self.find_saved_connection(ssid).await? else {
+            return Ok(false);
+        };
+        self.delete_connection(&path).await?;
+        Ok(true)
+    }
+
     pub async fn devices(&self) -> Result<Vec<DeviceInfo>, NetworkError> {
         let network_manager = Proxy::new(&self.connection, NM_DEST, NM_PATH, NM_IFACE).await?;
         let devices: Vec<OwnedObjectPath> = network_manager.call("GetDevices", &()).await?;
